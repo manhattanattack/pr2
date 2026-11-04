@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 
 [RequireComponent(typeof(CharacterController))]
@@ -20,6 +21,12 @@ public class LocalPlayerController : MonoBehaviour
     [SerializeField] private float crouchingHeight = 1f;
     [SerializeField] private float crouchTransitionSpeed = 10f;
 
+    [Header("Боевые компоненты")]
+    [SerializeField] private MeleeAnimator meleeAnimator;
+
+    public event Action OnAttackInputPressed;
+    public event Action OnRangedAttackInputPressed;
+
     private CharacterController controller;
     private Vector3 verticalVelocity;
     private float pitchAngle = 0f;
@@ -40,6 +47,18 @@ public class LocalPlayerController : MonoBehaviour
         HandleRotation();
         HandleCrouch();
         HandleMovement();
+        HandleCombatInput();
+    }
+
+    private void HandleCombatInput()
+    {
+        if (Input.GetMouseButtonDown(0))
+        {
+            if (meleeAnimator != null) meleeAnimator.PlaySwing();
+            OnAttackInputPressed?.Invoke();
+        }
+        if (Input.GetMouseButtonDown(1))
+            OnRangedAttackInputPressed?.Invoke();
     }
 
     private void HandleRotation()
