@@ -130,6 +130,18 @@ const wss = new WebSocketServer({ port: PORT });
 // Таблица активных сессий: clientId -> { ws, state }
 const players = new Map();
 
+// Авторитарные параметры боя: урон и попадания считает только сервер.
+const MELEE_RANGE = 2.2;
+const MELEE_DAMAGE = 25;
+const MELEE_COOLDOWN_MS = 600;
+const COS_HALF_ANGLE_45 = Math.cos(Math.PI / 4);
+const RANGED_DAMAGE = 20;
+const PROJECTILE_SPEED = 18.0;
+const PROJECTILE_LIFETIME_MS = 3000;
+const RANGED_COOLDOWN_MS = 500;
+const PLAYER_HIT_RADIUS = 0.7;
+const activeProjectiles = new Map();
+
 // Генерация карты при запуске сервера
 const globalWalls = generateArenaMaze(COLS, ROWS, CELL_SIZE);
 
@@ -160,10 +172,14 @@ wss.on('connection', (ws, req) => {
         z: spawnZ,
         yaw: 0.0,
         pitch: 0.0,
-        crouch: false
+        crouch: false,
+        hp: 100,
+        maxHp: 100,
+        isDead: false,
+        score: 0
     };
 
-    players.set(clientId, { ws, state: initialPlayerState });
+    players.set(clientId, { ws, state: initialPlayerState, lastAttackTime: 0, lastRangedTime: 0 });
     console.log(`[ПОДКЛЮЧЕНИЕ] Клиент ${clientId} (IP: ${clientIp}) вошел в сессию`);
 
     // 3. Отправка клиенту структуры лабиринта и точки спавна
@@ -171,6 +187,7 @@ wss.on('connection', (ws, req) => {
         type: 'INIT_WORLD',
         id: clientId,
         spawnPos: [initialPlayerState.x, initialPlayerState.y, initialPlayerState.z],
+        hp: initialPlayerState.hp,
         walls: globalWalls
     }));
 
@@ -191,15 +208,19 @@ wss.on('connection', (ws, req) => {
             // Синхронизация движения и взгляда
             if (data.type === 'MOVE') {
                 const session = players.get(clientId);
-                if (session) {
-                    session.state.x = Number(data.x);
-                    session.state.y = Number(data.y);
-                    session.state.z = Number(data.z);
-                    session.state.yaw = Number(data.yaw);
-                    session.state.pitch = Number(data.pitch);
-                    session.state.crouch = Boolean(data.crouch);
+                if (session && !session.state.isDead) {
+                    const fields = ['x', 'y', 'z', 'yaw', 'pitch'];
+                    const values = fields.map(key => Number(data[key]));
+                    if (values.every(Number.isFinite)) {
+                        [session.state.x, session.state.y, session.state.z,
+                         session.state.yaw, session.state.pitch] = values;
+                        session.state.crouch = Boolean(data.crouch);
+                    }
                 }
             }
+
+            if (data.type === 'ATTACK_MELEE') handleMeleeAttack(clientId);
+            if (data.type === 'FIRE_RANGED') handleRangedAttack(clientId);
         } catch (err) {
             console.error(`[ОШИБКА JSON] от ${clientId}: `, err.message);
         }
@@ -210,6 +231,9 @@ wss.on('connection', (ws, req) => {
         const session = players.get(clientId);
         const playerName = session ? session.state.name : clientId;
         players.delete(clientId);
+        for (const [projectileId, p] of activeProjectiles) {
+            if (p.ownerId === clientId) destroyProjectile(projectileId, 'disconnect');
+        }
         console.log(`[ОТКЛЮЧЕНИЕ] Игрок "${playerName}" (${clientId}) отключился`);
 
         // Оповещаем остальных клиентов об удалении аватара
@@ -223,6 +247,7 @@ wss.on('connection', (ws, req) => {
 
 // Игровой цикл: каждые 50 мс рассылаем снапшот мира всем подключенным
 setInterval(() => {
+    updateProjectiles(1 / TICK_RATE);
     if (players.size === 0) return;
 
     const snapshot = {
@@ -240,4 +265,168 @@ function broadcast(packet) {
             ws.send(rawData);
         }
     }
+}
+
+
+// ===== БЛИЖНИЙ БОЙ =====
+function handleMeleeAttack(attackerId) {
+    const attacker = players.get(attackerId);
+    if (!attacker || attacker.state.isDead) return;
+    const now = Date.now();
+    if (now - attacker.lastAttackTime < MELEE_COOLDOWN_MS) return;
+    attacker.lastAttackTime = now;
+    broadcast({ type: 'PLAYER_SWUNG', attackerId });
+
+    const yawRad = attacker.state.yaw * Math.PI / 180;
+    const forwardX = Math.sin(yawRad);
+    const forwardZ = Math.cos(yawRad);
+
+    // Попадание в первую подходящую цель (не наносим урон сквозь стены).
+    for (const [targetId, target] of players) {
+        if (targetId === attackerId || target.state.isDead) continue;
+        const dx = target.state.x - attacker.state.x;
+        const dz = target.state.z - attacker.state.z;
+        const distance = Math.hypot(dx, dz);
+        if (distance <= 0.001 || distance > MELEE_RANGE) continue;
+        const dot = forwardX * dx / distance + forwardZ * dz / distance;
+        if (dot >= COS_HALF_ANGLE_45) {
+            applyDamage(attacker, target, MELEE_DAMAGE);
+            break;
+        }
+    }
+}
+
+// ===== УРОН, ФРАГИ И ВОЗРОЖДЕНИЕ =====
+function applyDamage(attacker, target, damage) {
+    if (!attacker || !target || target.state.isDead) return;
+    target.state.hp = Math.max(0, target.state.hp - damage);
+    broadcast({
+        type: 'HIT_EVENT',
+        targetId: target.state.id,
+        attackerId: attacker.state.id,
+        currentHp: target.state.hp,
+        damage
+    });
+    console.log(`[УРОН] ${attacker.state.name} -> ${target.state.name}: -${damage} HP (осталось ${target.state.hp})`);
+    if (target.state.hp > 0) return;
+
+    target.state.isDead = true;
+    attacker.state.score += 1;
+    broadcast({
+        type: 'PLAYER_DIED',
+        victimId: target.state.id,
+        killerId: attacker.state.id,
+        killerScore: attacker.state.score
+    });
+    console.log(`[ГИБЕЛЬ] ${target.state.name} погиб. Побед ${attacker.state.name}: ${attacker.state.score}`);
+
+    setTimeout(() => {
+        // За время таймера клиент мог отключиться.
+        if (players.get(target.state.id) !== target) return;
+        respawnPlayer(target);
+    }, 3000);
+}
+
+function respawnPlayer(session) {
+    session.state.hp = session.state.maxHp;
+    session.state.isDead = false;
+    session.state.x = Number((SPAWN_CENTER_X + (Math.random() - 0.5) * 8).toFixed(2));
+    session.state.z = Number((SPAWN_CENTER_Z + (Math.random() - 0.5) * 8).toFixed(2));
+    session.state.y = 0;
+    broadcast({
+        type: 'PLAYER_RESPAWN',
+        id: session.state.id,
+        x: session.state.x,
+        y: session.state.y,
+        z: session.state.z,
+        hp: session.state.hp
+    });
+    console.log(`[РЕСПАВН] ${session.state.name} возродился`);
+}
+
+// ===== ДАЛЬНИЙ БОЙ =====
+function handleRangedAttack(attackerId) {
+    const attacker = players.get(attackerId);
+    if (!attacker || attacker.state.isDead) return;
+    const now = Date.now();
+    if (now - attacker.lastRangedTime < RANGED_COOLDOWN_MS) return;
+    attacker.lastRangedTime = now;
+
+    const yawRad = attacker.state.yaw * Math.PI / 180;
+    const pitchRad = attacker.state.pitch * Math.PI / 180;
+    const p = {
+        id: 'proj_' + Math.random().toString(36).slice(2, 10),
+        ownerId: attackerId,
+        x: attacker.state.x,
+        y: attacker.state.y + 1.5,
+        z: attacker.state.z,
+        dx: Math.sin(yawRad) * Math.cos(pitchRad),
+        dy: -Math.sin(pitchRad),
+        dz: Math.cos(yawRad) * Math.cos(pitchRad),
+        createdAt: now
+    };
+    activeProjectiles.set(p.id, p);
+    broadcast({
+        type: 'SPAWN_PROJECTILE',
+        id: p.id,
+        x: p.x, y: p.y, z: p.z,
+        dx: p.dx, dy: p.dy, dz: p.dz,
+        speed: PROJECTILE_SPEED
+    });
+}
+
+function updateProjectiles(dt) {
+    const now = Date.now();
+    for (const [id, p] of activeProjectiles) {
+        if (now - p.createdAt > PROJECTILE_LIFETIME_MS) {
+            destroyProjectile(id, 'timeout');
+            continue;
+        }
+        // Сервер самостоятельно рассчитывает перемещение в каждом тике.
+        p.x += p.dx * PROJECTILE_SPEED * dt;
+        p.y += p.dy * PROJECTILE_SPEED * dt;
+        p.z += p.dz * PROJECTILE_SPEED * dt;
+
+        if (p.y <= 0.1 || p.y >= 10.0) {
+            destroyProjectile(id, 'floor');
+            continue;
+        }
+
+        let hitWall = false;
+        for (const wall of globalWalls) {
+            const halfX = wall.rot === 0 ? 2.0 : 0.2;
+            const halfZ = wall.rot === 0 ? 0.2 : 2.0;
+            if (p.x >= wall.x - halfX && p.x <= wall.x + halfX &&
+                p.z >= wall.z - halfZ && p.z <= wall.z + halfZ &&
+                p.y <= 3.0) {
+                hitWall = true;
+                break;
+            }
+        }
+        if (hitWall) {
+            destroyProjectile(id, 'wall');
+            continue;
+        }
+
+        for (const [targetId, target] of players) {
+            if (targetId === p.ownerId || target.state.isDead) continue;
+            const distXZ = Math.hypot(target.state.x - p.x, target.state.z - p.z);
+            const distY = Math.abs(target.state.y + 1.0 - p.y);
+            if (distXZ <= PLAYER_HIT_RADIUS && distY <= 1.0) {
+                applyDamage(players.get(p.ownerId), target, RANGED_DAMAGE);
+                destroyProjectile(id, 'player');
+                break;
+            }
+        }
+    }
+}
+
+function destroyProjectile(id, reason) {
+    const p = activeProjectiles.get(id);
+    if (!p) return;
+    activeProjectiles.delete(id);
+    broadcast({
+        type: 'DESTROY_PROJECTILE',
+        id, x: p.x, y: p.y, z: p.z, reason
+    });
 }
